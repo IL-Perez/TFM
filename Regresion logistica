@@ -1,0 +1,479 @@
+
+/* 1. Paths */
+%let project_dir=C:\Users\Public\Master\TFM;
+%let origination_csv = &project_dir.\origination_reduced.csv;
+%let monitoring_csv  = &project_dir.\monitoring_reduced.csv;
+%let pdf_path      = &project_dir.\origination_monitoring_results.pdf;
+%let or_csv_path   = &project_dir.\sas_final_odds_ratios.csv;
+%let perf_csv_path = &project_dir.\sas_test_metrics.csv;
+
+/* 2. Initialize result tables */
+proc datasets lib=work nolist;
+    delete final_or_table final_perf_table;
+quit;
+
+data work.final_or_table;
+    length View $12 Method $12 Variable $32 Comparison $40 Reliability $60;
+    format OddsRatio LowerCL UpperCL 8.4;
+    View=""; Method=""; Variable=""; Comparison=""; Reliability="";
+    OddsRatio=.; LowerCL=.; UpperCL=.;
+    stop;
+run;
+
+data work.final_perf_table;
+    length View $12 Method $12 Reliability $60;
+    format Accuracy Precision_NoViable Recall_NoViable F1_NoViable
+           BalancedAccuracy ROC_AUC 8.4;
+    View=""; Method=""; Reliability="";
+    Accuracy=.; Precision_NoViable=.; Recall_NoViable=.; F1_NoViable=.;
+    BalancedAccuracy=.; ROC_AUC=.;
+    TP_NoViable=.; FN_NoViable=.; FP_NoViable=.; TN_NoViable=.;
+    stop;
+run;
+
+/* 3. Define the pipeline for each analytical view */
+%macro run_view(
+    view=,
+    csv_path=,
+    ds=,
+    predictors=,
+    units_stmt=,
+    n_or_rows=
+);
+
+%local n_train n_test
+       log_flag_std nonfinite_flag_std reliability_std reliability_firth
+       firth_error units_native
+       n_std_or n_firth_or;
+
+
+/* 4. Import data and preserve the existing train/test partition */
+proc import datafile="&csv_path"
+    out=work.&ds
+    dbms=csv
+    replace;
+    getnames=yes;
+    guessingrows=max;
+run;
+
+data work.&ds;
+    set work.&ds;
+    length split_clean $10;
+    split_clean = lowcase(strip(split));
+run;
+
+data work.&ds._train work.&ds._test;
+    set work.&ds;
+    if split_clean = "train" then output work.&ds._train;
+    else if split_clean = "test" then output work.&ds._test;
+
+run;
+
+proc sql noprint;
+    select count(*) into :n_train trimmed from work.&ds._train;
+    select count(*) into :n_test  trimmed from work.&ds._test;
+quit;
+
+/* 5. Standard ML logistic regression on TRAIN */
+proc printto log="%sysfunc(pathname(work))/&ds._std.log" new;
+run;
+
+ods trace on / listing;
+
+proc logistic data=work.&ds._train;
+    class riesgo_legal_titulo (ref='bajo') / param=ref;
+    model operacion_viable(event='1') = &predictors / clodds=wald;
+    units &units_stmt;
+    ods output ParameterEstimates = work.&ds._std_parms
+               CLOddsWald         = work.&ds._std_or
+               ConvergenceStatus  = work.&ds._std_conv;
+run;
+
+ods trace off;
+
+proc printto;
+run;
+
+data _null_;
+    infile "%sysfunc(pathname(work))/&ds._std.log" length=len end=eof;
+    input line $varying500. len;
+    put "STDLOG[&view]: " line;
+run;
+
+%if not %sysfunc(exist(work.&ds._std_or)) %then %do;
+%put ERROR: [&view] Standard ML odds-ratio output was not created.;
+%end;
+
+%let log_flag_std = 0;
+data _null_;
+    infile "%sysfunc(pathname(work))/&ds._std.log" length=len end=eof;
+    input line $varying500. len;
+    line_upper = upcase(line);
+    if index(line_upper,'SEPARAT') > 0
+       or index(line_upper,'QUASICOMPLETE') > 0
+       or index(line_upper,'DID NOT CONVERGE') > 0
+       or index(line_upper,'CONVERGENCE COULD NOT BE ATTAINED') > 0
+       or index(line_upper,'VALIDITY OF THE MODEL FIT IS QUESTIONABLE') > 0
+       or index(line_upper,'MAXIMUM LIKELIHOOD ESTIMATE MAY NOT EXIST') > 0
+       or index(line_upper,'INFINITE PARAMETER') > 0
+       or index(line_upper,'FAILED TO CONVERGE') > 0
+       or index(line_upper,'HESSIAN') > 0
+       or index(line_upper,'NOT POSITIVE DEFINITE') > 0
+    then call symputx('log_flag_std','1');
+run;
+
+%let nonfinite_flag_std = 0;
+data _null_;
+    set work.&ds._std_parms end=eof;
+    retain nonfinite 0;
+    if missing(Estimate) or missing(StdErr) or StdErr > 100 then nonfinite = 1;
+    if eof then call symputx('nonfinite_flag_std', put(nonfinite,1.));
+run;
+
+%let reliability_std = Reliable;
+%if &log_flag_std = 1 or &nonfinite_flag_std = 1 %then %do;
+    %let reliability_std = Unreliable - see log (separation/nonconvergence/nonfinite);
+    %put WARNING: [&view] Standard ML flagged unreliable. log_flag=&log_flag_std nonfinite_flag=&nonfinite_flag_std;
+%end;
+
+/* 6. Firth bias-corrected logistic regression on TRAIN */
+%let units_native = 1;
+%let firth_error   = 0;
+
+proc printto log="%sysfunc(pathname(work))/&ds._firth.log" new;
+run;
+
+proc logistic data=work.&ds._train;
+    class riesgo_legal_titulo (ref='bajo') / param=ref;
+    model operacion_viable(event='1') = &predictors / firth clodds=pl;
+    units &units_stmt;
+    ods output ParameterEstimates = work.&ds._firth_parms
+               CLoddsPL           = work.&ds._firth_clodds
+               ConvergenceStatus  = work.&ds._firth_conv;
+run;
+
+proc printto;
+run;
+
+data _null_;
+    infile "%sysfunc(pathname(work))/&ds._firth.log" length=len end=eof;
+    input line $varying500. len;
+    put "FIRTHLOG[&view]: " line;
+run;
+
+data _null_;
+    infile "%sysfunc(pathname(work))/&ds._firth.log" length=len end=eof;
+    input line $varying500. len;
+    line_upper = upcase(line);
+    if index(line_upper,'ERROR') > 0 then call symputx('firth_error','1');
+run;
+
+%if &firth_error = 1 %then %do;
+    %put WARNING: [&view] UNITS appears incompatible with FIRTH in this SAS;
+    %put WARNING: [&view] version. Refitting FIRTH without UNITS and manually;
+    %put WARNING: [&view] converting LTV / equity_promotor_pct to a 5-point;
+    %put WARNING: [&view] increase (OR_1unit ** 0.05).;
+
+    %let units_native = 0;
+
+    proc logistic data=work.&ds._train;
+        class riesgo_legal_titulo (ref='bajo') / param=ref;
+        model operacion_viable(event='1') = &predictors / firth clodds=pl;
+        ods output ParameterEstimates = work.&ds._firth_parms
+                   CLoddsPL           = work.&ds._firth_clodds
+                   ConvergenceStatus  = work.&ds._firth_conv;
+    run;
+
+    data work.&ds._firth_clodds;
+        set work.&ds._firth_clodds;
+        length converted_note $60;
+        if upcase(strip(Effect)) in ('LTV','EQUITY_PROMOTOR_PCT') then do;
+            OddsRatioEst = OddsRatioEst ** 0.05;
+            LowerCL      = LowerCL ** 0.05;
+            UpperCL      = UpperCL ** 0.05;
+            converted_note = "Converted from native per-1-unit Firth OR (see log)";
+        end;
+        else converted_note = "Native Firth output, no conversion";
+    run;
+%end;
+
+/* 7. Score TEST separately for EACH method */
+proc logistic data=work.&ds._train;
+    class riesgo_legal_titulo (ref='bajo') / param=ref;
+    model operacion_viable(event='1') = &predictors / clodds=wald;
+    units &units_stmt;
+    score data=work.&ds._test out=work.&ds._std_scored fitstat;
+    ods output ScoreFitStat = work.&ds._std_fitstat;
+run;
+
+%if &units_native = 1 %then %do;
+    proc logistic data=work.&ds._train;
+        class riesgo_legal_titulo (ref='bajo') / param=ref;
+        model operacion_viable(event='1') = &predictors / firth clodds=pl;
+        units &units_stmt;
+        score data=work.&ds._test out=work.&ds._firth_scored fitstat;
+        ods output ScoreFitStat = work.&ds._firth_fitstat;
+    run;
+%end;
+%else %do;
+    proc logistic data=work.&ds._train;
+        class riesgo_legal_titulo (ref='bajo') / param=ref;
+        model operacion_viable(event='1') = &predictors / firth clodds=pl;
+        score data=work.&ds._test out=work.&ds._firth_scored fitstat;
+        ods output ScoreFitStat = work.&ds._firth_fitstat;
+    run;
+%end;
+
+proc contents data=work.&ds._std_fitstat varnum;
+    title "[&view] Standard ML ScoreFitStat structure -- verify AUC column exists";
+run;
+proc contents data=work.&ds._firth_fitstat varnum;
+    title "[&view] Firth ScoreFitStat structure -- verify AUC column exists";
+run;
+title;
+
+/* 8. Confusion matrix + metrics for each method */
+%macro score_metrics(method_ds=, fitstat_ds=, method_label=);
+
+    data work.&method_ds._class;
+        set work.&method_ds;
+        predicted_class = (P_1 >= 0.50);
+        actual_class = operacion_viable;
+    run;
+
+    data _null_;
+        set work.&method_ds._class end=eof;
+        retain tp_focal 0 fn_focal 0 fp_focal 0 tn_focal 0;
+        if actual_class = 0 and predicted_class = 0 then tp_focal + 1;
+        else if actual_class = 0 and predicted_class = 1 then fn_focal + 1;
+        else if actual_class = 1 and predicted_class = 0 then fp_focal + 1;
+        else if actual_class = 1 and predicted_class = 1 then tn_focal + 1;
+
+        if eof then do;
+            total = tp_focal + fn_focal + fp_focal + tn_focal;
+            accuracy = (tp_focal + tn_focal) / total;
+            precision_0 = tp_focal / max(1,(tp_focal + fp_focal));
+            recall_0 = tp_focal / max(1,(tp_focal + fn_focal));
+            f1_0 = 2 * precision_0 * recall_0 / max(1e-8,(precision_0 + recall_0));
+            recall_1 = tn_focal / max(1,(tn_focal + fp_focal));
+            balanced_accuracy = (recall_0 + recall_1) / 2;
+
+            call symputx("tp0_&method_ds", tp_focal, 'G');
+            call symputx("fn0_&method_ds", fn_focal, 'G');
+            call symputx("fp0_&method_ds", fp_focal, 'G');
+            call symputx("tn0_&method_ds", tn_focal, 'G');
+            call symputx("acc_&method_ds", put(accuracy,8.4), 'G');
+            call symputx("prec0_&method_ds", put(precision_0,8.4), 'G');
+            call symputx("rec0_&method_ds", put(recall_0,8.4), 'G');
+            call symputx("f1_0_&method_ds", put(f1_0,8.4), 'G');
+            call symputx("bal_acc_&method_ds", put(balanced_accuracy,8.4), 'G');
+
+            put "NOTE: [&method_label] TEST confusion matrix, focal class = No viable (0):";
+            put "NOTE: TP(0)=" tp_focal " FN(0)=" fn_focal " FP(0)=" fp_focal " TN(0)=" tn_focal;
+            put "NOTE: Accuracy=" accuracy " Precision(0)=" precision_0
+                " Recall(0)=" recall_0 " F1(0)=" f1_0 " BalancedAccuracy=" balanced_accuracy;
+        end;
+    run;
+
+    data _null_;
+        set work.&fitstat_ds end=eof;
+        call symputx("auc_&method_ds", put(AUC,8.4), 'G');
+    run;
+
+%mend score_metrics;
+
+%score_metrics(method_ds=&ds._std_scored,   fitstat_ds=&ds._std_fitstat,   method_label=&view Standard ML);
+%score_metrics(method_ds=&ds._firth_scored, fitstat_ds=&ds._firth_fitstat, method_label=&view Firth);
+
+/* 9. Export the four validation-checked scored CSVs */
+%macro export_scored(method_ds=, out_csv=, method_label=);
+
+    data work._export_&method_ds;
+        set work.&method_ds;
+        keep operation_id operacion_viable P_0 P_1;
+    run;
+
+    proc export data=work._export_&method_ds
+        outfile="&project_dir.\&out_csv"
+        dbms=csv
+        replace;
+    run;
+
+    proc sql noprint;
+        select count(*), count(distinct operation_id)
+            into :n_rows_&method_ds trimmed, :n_unique_&method_ds trimmed
+            from work._export_&method_ds;
+    quit;
+
+    %if &&n_unique_&method_ds ^= 140 %then
+        %put WARNING: [&method_label] Expected 140 unique operation_id, got &&n_unique_&method_ds !!!;
+
+    data _null_;
+        set work._export_&method_ds;
+        if abs((P_0 + P_1) - 1) > 0.0001 then
+            put "WARNING: [&method_label] operation_id=" operation_id
+                " P_0+P_1=" P_0 P_1 " does not sum to 1 within tolerance";
+    run;
+
+%mend export_scored;
+
+%export_scored(method_ds=&ds._std_scored,   out_csv=&ds._standard_scored.csv, method_label=&view Standard ML);
+%export_scored(method_ds=&ds._firth_scored, out_csv=&ds._firth_scored.csv,    method_label=&view Firth);
+
+/* 10. Build Standard ML and Firth odds-ratio rows for the current view */
+%macro build_or_rows(src_ds=, method_label=, method_text=, reliability_text=);
+
+    data work.&ds._&method_label._rows;
+        length View $12 Method $12 Variable $32 Comparison $40 Reliability $60;
+        set work.&src_ds;
+        View = "&view";
+        Method = "&method_text";
+        Reliability = "&reliability_text";
+        Effect_upper = upcase(strip(Effect));
+        select;
+            when (index(Effect_upper,'LTV') > 0)
+                do; Variable = "LTV"; Comparison = "per 5-percentage-point increase"; end;
+            when (index(Effect_upper,'DOCUMENTACION_COMPLE') > 0)
+                do; Variable = "documentacion_completa"; Comparison = "1 versus 0"; end;
+            when (index(Effect_upper,'EQUITY_PROMOTOR_PCT') > 0)
+                do; Variable = "equity_promotor_pct"; Comparison = "per 5-percentage-point increase"; end;
+            when (index(Effect_upper,'MEDIO') > 0)
+                do; Variable = "riesgo_legal_titulo"; Comparison = "medio versus bajo"; end;
+            when (index(Effect_upper,'ALTO') > 0)
+                do; Variable = "riesgo_legal_titulo"; Comparison = "alto versus bajo"; end;
+            when (index(Effect_upper,'RETRASO_OBRA_MESES') > 0)
+                do; Variable = "retraso_obra_meses"; Comparison = "per one-month increase"; end;
+            otherwise
+                do; Variable = Effect; Comparison = "(unmatched effect label, check manually)"; end;
+        end;
+        OddsRatio = OddsRatioEst;
+        LowerCL = LowerCL;
+        UpperCL = UpperCL;
+        keep View Method Variable Comparison OddsRatio LowerCL UpperCL Reliability;
+    run;
+
+    proc sql noprint;
+        select count(*) into :n_check_&method_label trimmed
+            from work.&ds._&method_label._rows;
+    quit;
+
+    proc append base=work.final_or_table data=work.&ds._&method_label._rows force;
+    run;
+
+%mend build_or_rows;
+
+%if %sysfunc(exist(work.&ds._std_or)) %then %do;
+    %build_or_rows(src_ds=&ds._std_or, method_label=std, method_text=Standard ML, reliability_text=&reliability_std);
+%end;
+
+%let reliability_firth = %str(Bias-corrected (small-sample), used alongside Standard ML);
+%build_or_rows(src_ds=&ds._firth_clodds, method_label=firth, method_text=Firth, reliability_text=&reliability_firth);
+
+/* 11. Assert row counts for both methods */
+%if %sysfunc(exist(work.&ds._std_rows)) %then %do;
+    proc sql noprint;
+        select count(*) into :n_std_or trimmed from work.&ds._std_rows;
+    quit;
+%end;
+%else %let n_std_or = 0;
+
+proc sql noprint;
+    select count(*) into :n_firth_or trimmed from work.&ds._firth_rows;
+quit;
+
+%if &n_std_or ^= &n_or_rows %then
+    %put WARNING: [&view] Standard ML OR row count mismatch! Expected &n_or_rows, got &n_std_or.;
+%if &n_firth_or ^= &n_or_rows %then
+    %put WARNING: [&view] Firth OR row count mismatch! Expected &n_or_rows, got &n_firth_or.;
+
+/* 12. Build Standard ML and Firth performance for current view */
+%macro build_perf_row(method_ds=, method_label=, reliability=);
+    data work.&method_ds._perf;
+        length View $12 Method $12 Reliability $60;
+        View = "&view";
+        Method = "&method_label";
+        Reliability = "&reliability";
+        Accuracy = input("&&acc_&method_ds",8.4);
+        Precision_NoViable = input("&&prec0_&method_ds",8.4);
+        Recall_NoViable = input("&&rec0_&method_ds",8.4);
+        F1_NoViable = input("&&f1_0_&method_ds",8.4);
+        BalancedAccuracy = input("&&bal_acc_&method_ds",8.4);
+        ROC_AUC = input("&&auc_&method_ds",8.4);
+        TP_NoViable = &&tp0_&method_ds;
+        FN_NoViable = &&fn0_&method_ds;
+        FP_NoViable = &&fp0_&method_ds;
+        TN_NoViable = &&tn0_&method_ds;
+    run;
+    proc append base=work.final_perf_table data=work.&method_ds._perf force;
+    run;
+%mend build_perf_row;
+
+%build_perf_row(method_ds=&ds._std_scored,   method_label=Standard ML, reliability=&reliability_std);
+%build_perf_row(method_ds=&ds._firth_scored, method_label=Firth,       reliability=Bias-corrected (small-sample));
+
+%mend run_view;
+
+/* 13. Run Origination and Monitoring pipelines */
+ods pdf file="&pdf_path" style=HTMLBlue;
+ods graphics on;
+
+%run_view(
+    view=Origination,
+    csv_path=&origination_csv,
+    ds=origin,
+    predictors=LTV documentacion_completa equity_promotor_pct riesgo_legal_titulo,
+    units_stmt=LTV=0.05 equity_promotor_pct=0.05 documentacion_completa=1,
+    n_or_rows=5
+);
+
+%run_view(
+    view=Monitoring,
+    csv_path=&monitoring_csv,
+    ds=monitor,
+    predictors=LTV documentacion_completa equity_promotor_pct riesgo_legal_titulo retraso_obra_meses,
+    units_stmt=LTV=0.05 equity_promotor_pct=0.05 documentacion_completa=1 retraso_obra_meses=1,
+    n_or_rows=6
+);
+
+title "Final odds-ratio table -- Origination and Monitoring, Standard ML and Firth";
+proc print data=work.final_or_table noobs;
+    var View Method Variable Comparison OddsRatio LowerCL UpperCL Reliability;
+    format OddsRatio LowerCL UpperCL 8.4;
+run;
+title;
+
+title "Final performance table -- Origination and Monitoring, Standard ML and Firth";
+proc print data=work.final_perf_table noobs;
+run;
+title;
+
+ods pdf close;
+
+/* 14. Final row-count assertions across BOTH views combined */
+proc sql noprint;
+    select count(*) into :n_or_total trimmed from work.final_or_table;
+    select count(*) into :n_perf_total trimmed from work.final_perf_table;
+quit;
+
+%macro final_checks;
+    %if &n_or_total ^= 22 %then %do;
+    %put WARNING: Final odds-ratio table row count is &n_or_total; expected 22.;
+%end;
+    %if &n_perf_total ^= 4 %then
+        %put WARNING: FINAL PERFORMANCE TABLE DOES NOT HAVE 4 ROWS.;
+%mend final_checks;
+%final_checks;
+
+/* 15. Export final tables to CSV */
+proc export data=work.final_or_table
+    outfile="&or_csv_path"
+    dbms=csv
+    replace;
+run;
+
+proc export data=work.final_perf_table
+    outfile="&perf_csv_path"
+    dbms=csv
+    replace;
+run;
+
